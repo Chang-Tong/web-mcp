@@ -1,0 +1,31 @@
+{
+  "name": "web-mcp",
+  "version": "0.1.0",
+  "description": "联网 MCP 服务：web_search（DuckDuckGo/Serper）+ fetch_page，支持 stdio 与 Streamable HTTP 部署",
+  "type": "module",
+  "bin": {
+    "web-mcp": "src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "http": "node src/index.mjs --http 8787",
+    "test": "node test-client.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Chang-Tong/web-mcp.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@mozilla/readability": "^0.6.0",
+    "linkedom": "^0.18.13",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
+    "playwright-core": "^1.62.1",
+    "undici": "^8.10.0"
+  }
+}

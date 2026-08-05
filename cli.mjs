@@ -1,5 +1,5 @@
 // web-mcp CLI 包装：供 Python/脚本调用（stdio JSON 输出）
-//   node search-cli.mjs "查询词" [条数]   → {"results": [...], "failures": [...]}
+//   node search-cli.mjs "查询词" [条数] [引擎,逗号分隔]   → {"results": [...], "failures": [...]}
 //   node fetch-cli.mjs "URL" [text|readable|json] [maxChars] → {"content": "...", "title": "..."}
 import { webSearch } from "./src/search.mjs";
 import { fetchPage } from "./src/fetch.mjs";
@@ -10,8 +10,9 @@ async function main() {
   if (cmd === "search") {
     const query = arg1 || "";
     const n = parseInt(arg2 || "5", 10);
+    const engines = arg3 ? arg3.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
     if (!query) { console.log(JSON.stringify({ error: "no query" })); return; }
-    const res = await webSearch(query, n);
+    const res = await webSearch(query, { maxResults: n, engines });
     console.log(JSON.stringify(res));
   } else if (cmd === "fetch") {
     const url = arg1 || "";

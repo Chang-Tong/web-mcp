@@ -33,7 +33,9 @@
 
 ### 1. `web_search` — 多引擎并行搜索
 
-免 key 引擎并行执行，请求条数按引擎均分，结果按 URL 去重合并，每条带 `engine` 来源标签。
+免 key 引擎并行执行，每个引擎满额请求，结果按 URL 去重合并，每条带 `engine` 来源标签。
+
+**时间盒竞速**：默认 5 秒（`WEB_MCP_TIME_BOX` 可调）。结果数达标（≥ `max_results`）立即取消其余引擎提前返回；到期未达标也返回已有结果，绝不等待最慢引擎。返回 `elapsedMs`（实际耗时）、`waived`（因时间盒放弃的引擎）、`timeBoxMs`。
 
 **意图感知路由**（auto 模式）：
 
@@ -143,6 +145,7 @@ curl http://localhost:8787/health   # 健康检查，返回 { ok: true, ... }
 | `WEB_MCP_BROWSER_PATH` | 自动探测 | 指定浏览器可执行文件路径（系统 Chrome/Edge、playwright 缓存自动探测） |
 | `WEB_MCP_AUTH_TOKEN` | — | HTTP 模式鉴权，设置后要求 `Authorization: Bearer <token>` |
 | `WEB_MCP_DEBUG` | — | 设为 `1` 输出每个引擎的执行日志（stderr） |
+| `WEB_MCP_TIME_BOX` | `5000` | web_search 时间盒（ms）：达标提前收 / 到期返回已有结果，不等最慢引擎 |
 
 代理自动生效：`http_proxy` / `https_proxy` / `no_proxy`（undici `EnvHttpProxyAgent`），无代理环境自动直连，无需额外配置。
 

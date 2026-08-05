@@ -58,6 +58,22 @@ function cleanText(html) {
   return decodeEntities(html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
 }
 
+/** 响应时间盒信号的 sleep：abort 时立即抛 AbortError，不睡满 */
+async function sleepWithSignal(ms, signal) {
+  if (signal?.aborted) throw new DOMException("timebox", "AbortError");
+  if (!signal) {
+    await new Promise((r) => setTimeout(r, ms));
+    return;
+  }
+  await new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => {
+      clearTimeout(t);
+      reject(new DOMException("timebox", "AbortError"));
+    }, { once: true });
+  });
+}
+
 function hostnameOf(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -66,9 +82,15 @@ function hostnameOf(url) {
   }
 }
 
-async function httpFetch(url, { method = "GET", body, headers = {}, timeoutMs } = {}) {
+async function httpFetch(url, { method = "GET", body, headers = {}, timeoutMs, signal } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // 外部信号（时间盒竞速）：外部 abort 时立即取消本请求
+  const onAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) throw new DOMException("timebox", "AbortError");
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
   try {
     const host = new URL(url).hostname;
     const jar = cookieJar.get(host);
@@ -85,6 +107,7 @@ async function httpFetch(url, { method = "GET", body, headers = {}, timeoutMs } 
     return await res.text();
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -112,7 +135,8 @@ function assertNotBotPage(html, engine) {
 }
 
 /** 搜索引擎被风控时的终极兜底：真实浏览器渲染同一 URL 再解析（需浏览器可用） */
-async function browserFallback(url, parseFn) {
+async function browserFallback(url, parseFn, { signal, timeoutMs = 30_000 } = {}) {
+  if (signal?.aborted) throw new DOMException("timebox", "AbortError");
   let renderPage;
   try {
     ({ renderPage } = await import("./browser.mjs"));
@@ -120,7 +144,11 @@ async function browserFallback(url, parseFn) {
   } catch {
     return null;
   }
-  const { html } = await renderPage(url, { timeoutMs: 30_000 });
+  // playwright 导航不响应 AbortSignal：超时压缩到剩余时间盒预算，避免拖满 30s
+  const remaining = signal?.__remainingMs ? signal.__remainingMs() : timeoutMs;
+  const budget = Math.max(1000, Math.min(timeoutMs, remaining));
+  const { html } = await renderPage(url, { timeoutMs: budget });
+  if (signal?.aborted) throw new DOMException("timebox", "AbortError");
   const results = parseFn(html);
   return results && results.length > 0 ? results : null;
 }
@@ -156,33 +184,35 @@ function parseBraveHtml(html) {
 
 // brave 对高频请求敏感，全局节流：相邻请求至少间隔 1.5s
 let lastBraveTs = 0;
-async function braveThrottle() {
+async function braveThrottle(signal) {
   const gap = 1500 - (Date.now() - lastBraveTs);
-  if (gap > 0) await new Promise((r) => setTimeout(r, gap));
+  if (gap > 0) await sleepWithSignal(gap, signal);
   lastBraveTs = Date.now();
 }
 
-async function braveSearch(query, { maxResults = 5, timeoutMs = 15_000, recency } = {}) {
-  await braveThrottle();
+async function braveSearch(query, { maxResults = 5, timeoutMs = 15_000, recency, signal } = {}) {
+  await braveThrottle(signal);
+  if (signal?.aborted) throw new DOMException("timebox", "AbortError");
   let url = `https://search.brave.com/search?q=${encodeURIComponent(query)}&source=web`;
   const tf = { day: "pd", week: "pw", month: "pm", year: "py" }[recency];
   if (tf) url += `&tf=${tf}`;
-  // 429/403 限流时退避重试：等 2s → 再等 5s
+  // 429/403 限流时退避重试：等 2s → 再等 5s（受时间盒约束，到期即放弃）
   const waits = [0, 2000, 5000];
   let lastErr = null;
   for (const wait of waits) {
-    if (wait) await new Promise((r) => setTimeout(r, wait));
+    if (wait) await sleepWithSignal(wait, signal);
     try {
-      const html = await httpFetch(url, { timeoutMs });
+      const html = await httpFetch(url, { timeoutMs, signal });
       assertNotBotPage(html, "brave");
       return { engine: "brave", results: parseBraveHtml(html).slice(0, maxResults) };
     } catch (err) {
       lastErr = err;
+      if (err?.name === "AbortError") throw err;
       if (!/HTTP (429|403)/.test(err.message)) throw err;
     }
   }
-  // 持续限流 → 浏览器兜底
-  const fb = await browserFallback(url, parseBraveHtml);
+  // 持续限流 → 浏览器兜底（时间盒到期则放弃）
+  const fb = await browserFallback(url, parseBraveHtml, { signal });
   if (fb) return { engine: "brave(browser)", results: fb.slice(0, maxResults) };
   throw new Error(`HTTP 429 (brave 持续限流${lastErr ? `: ${lastErr.message}` : ""})`);
 }
@@ -219,23 +249,24 @@ function looksIrrelevant(query, results) {
   return hit / cjk.length < 0.5;
 }
 
-async function bingSearch(query, { maxResults = 5, timeoutMs = 10_000, recency } = {}) {
+async function bingSearch(query, { maxResults = 5, timeoutMs = 10_000, recency, signal } = {}) {
   let url = `https://cn.bing.com/search?q=${encodeURIComponent(query)}&count=${Math.min(maxResults, 20)}`;
   const freshness = { day: "Day", week: "Week", month: "Month", year: "Year" }[recency];
   if (freshness) url += `&freshness=${freshness}`;
   let results = [];
   try {
-    const html = await httpFetch(url, { timeoutMs });
+    const html = await httpFetch(url, { timeoutMs, signal });
     assertNotBotPage(html, "bing");
     results = parseBingHtml(html).slice(0, maxResults);
     if (results.length === 0) throw new Error("bing: 空结果");
     if (looksIrrelevant(query, results)) throw new Error("bing: 结果与查询无关（中文分词问题）");
     return { engine: "bing", results };
   } catch (err) {
+    if (err?.name === "AbortError") throw err;
     if (!/HTTP (429|403)|反爬|空结果|无关/.test(err.message)) throw err;
   }
-  // 被风控/低质 → 浏览器兜底（真浏览器会话能拿到正常 SERP）
-  const fb = await browserFallback(url, parseBingHtml);
+  // 被风控/低质 → 浏览器兜底（时间盒到期则放弃）
+  const fb = await browserFallback(url, parseBingHtml, { signal });
   if (fb && !looksIrrelevant(query, fb)) return { engine: "bing(browser)", results: fb.slice(0, maxResults) };
   return { engine: "bing", results: [], note: "bing 被风控且浏览器兜底失败" };
 }
@@ -265,21 +296,21 @@ function parseBaiduHtml(html) {
   return results;
 }
 
-async function baiduSearch(query, { maxResults = 5, timeoutMs = 10_000 } = {}) {
+async function baiduSearch(query, { maxResults = 5, timeoutMs = 10_000, signal } = {}) {
   const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`;
-  // 百度间歇性返回验证页/跳转页（无结果容器即视为被挡），等待后重试一次
+  // 百度间歇性返回验证页/跳转页（无结果容器即视为被挡），等待后重试一次（受时间盒约束）
   for (let attempt = 1; ; attempt++) {
-    const html = await httpFetch(url, { timeoutMs });
+    const html = await httpFetch(url, { timeoutMs, signal });
     assertNotBotPage(html, "baidu");
     const results = parseBaiduHtml(html).slice(0, maxResults);
     if (results.length > 0 || attempt >= 2) {
       if (results.length > 0) return { engine: "baidu", results };
       break; // 两次都被挡，进入浏览器兜底
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    await sleepWithSignal(2000, signal);
   }
   // 百度验证页 → 浏览器兜底
-  const fb = await browserFallback(url, parseBaiduHtml);
+  const fb = await browserFallback(url, parseBaiduHtml, { signal });
   if (fb) return { engine: "baidu(browser)", results: fb.slice(0, maxResults) };
   return { engine: "baidu", results: [], note: "百度返回了空结果（可能被反爬）" };
 }
@@ -375,15 +406,15 @@ async function csdnSearch(query, { maxResults = 5, timeoutMs = 10_000 } = {}) {
 // ---------- GitHub 仓库搜索（意图路由 code 场景，JSON API，内置节流） ----------
 
 let lastGithubTs = 0;
-async function githubThrottle() {
+async function githubThrottle(signal) {
   // 未认证 10 req/min，保守起见 7s 间隔
   const gap = 7000 - (Date.now() - lastGithubTs);
-  if (gap > 0) await new Promise((r) => setTimeout(r, gap));
+  if (gap > 0) await sleepWithSignal(gap, signal);
   lastGithubTs = Date.now();
 }
 
-async function githubSearch(query, { maxResults = 5, timeoutMs = 12_000 } = {}) {
-  await githubThrottle();
+async function githubSearch(query, { maxResults = 5, timeoutMs = 12_000, signal } = {}) {
+  await githubThrottle(signal);
   const json = await httpFetch(
     `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=${maxResults}`,
     { timeoutMs, headers: { Accept: "application/vnd.github+json" } }
@@ -521,12 +552,6 @@ const ENGINES = {
   tavily: { exec: tavilySearch, timeoutMs: 12_000 },
 };
 
-function distributeLimit(total, count) {
-  const base = Math.floor(total / count);
-  const remainder = total % count;
-  return Array.from({ length: count }, (_, i) => base + (i < remainder ? 1 : 0));
-}
-
 function normalizeUrl(url) {
   try {
     const u = new URL(url);
@@ -610,61 +635,90 @@ function resolveEngines(query, requested) {
   return { engines, intent };
 }
 
-export async function webSearch(query, { maxResults = 5, engines, recency } = {}) {
+export async function webSearch(query, { maxResults = 5, engines, recency, timeBoxMs } = {}) {
   if (!query || !query.trim()) throw new Error("query 不能为空");
+  const t0 = Date.now();
   const { engines: engineNames, intent } = await resolveEngines(query, engines);
-  const limits = distributeLimit(maxResults, engineNames.length);
   const debug = !!process.env.WEB_MCP_DEBUG;
+  const boxMs = timeBoxMs || Number(process.env.WEB_MCP_TIME_BOX) || 5000;
+  const deadline = Date.now() + boxMs;
+  const abortCtrl = new AbortController();
 
-  // 并行执行所有引擎，单个失败不影响整体
-  const settled = await Promise.allSettled(
-    engineNames.map(async (name, i) => {
-      if (name === "serper") {
-        const apiKey = process.env.SERPER_API_KEY;
-        if (!apiKey) throw new Error("需要设置环境变量 SERPER_API_KEY");
-        return serperSearch(query, { maxResults: limits[i], apiKey });
+  const results = []; // {engine, results}
+  const failures = [];
+  const waived = []; // 因时间盒到期/达标提前收而放弃的引擎
+
+  // 时间盒：到期 abort 所有未完成的引擎请求，不等最慢的
+  const boxTimer = setTimeout(() => abortCtrl.abort(), boxMs);
+  // 浏览器兜底读取剩余预算
+  abortCtrl.signal.__remainingMs = () => Math.max(0, deadline - Date.now());
+
+  await Promise.all(
+    engineNames.map(async (name) => {
+      try {
+        let out;
+        if (name === "serper") {
+          const apiKey = process.env.SERPER_API_KEY;
+          if (!apiKey) throw new Error("需要设置环境变量 SERPER_API_KEY");
+          out = await serperSearch(query, { maxResults, apiKey, recency, signal: abortCtrl.signal });
+        } else if (name === "tavily") {
+          const apiKey = process.env.TAVILY_API_KEY;
+          if (!apiKey) throw new Error("需要设置环境变量 TAVILY_API_KEY");
+          out = await tavilySearch(query, { maxResults, apiKey, signal: abortCtrl.signal });
+        } else {
+          const engine = ENGINES[name];
+          if (!engine) throw new Error(`未知搜索引擎: ${name}`);
+          // 每个引擎满额请求（不再均分），合并去重后截断
+          out = await engine.exec(query, { maxResults, timeoutMs: engine.timeoutMs, recency, signal: abortCtrl.signal });
+        }
+        if (out.results.length > 0) {
+          results.push({ engine: name, results: out.results });
+          if (debug) console.error(`[web-mcp] ${name}: ${out.results.length} 条`);
+        } else {
+          failures.push({ engine: name, message: out.note || "空结果" });
+          if (debug) console.error(`[web-mcp] ${name}: 空结果`);
+        }
+      } catch (err) {
+        if (err?.name === "AbortError") {
+          waived.push(name);
+          if (debug) console.error(`[web-mcp] ${name}: 时间盒放弃`);
+        } else {
+          failures.push({ engine: name, message: err?.message || String(err) });
+          if (debug) console.error(`[web-mcp] ${name}: ${err?.message}`);
+        }
       }
-      if (name === "tavily") {
-        const apiKey = process.env.TAVILY_API_KEY;
-        if (!apiKey) throw new Error("需要设置环境变量 TAVILY_API_KEY");
-        return tavilySearch(query, { maxResults: limits[i], apiKey });
+      // 达标提前收：已收集结果 >= maxResults 时取消其余引擎
+      const have = results.reduce((n, x) => n + x.results.length, 0);
+      if (have >= maxResults && !abortCtrl.signal.aborted) {
+        abortCtrl.abort();
       }
-      const engine = ENGINES[name];
-      if (!engine) throw new Error(`未知搜索引擎: ${name}`);
-      return engine.exec(query, { maxResults: limits[i], timeoutMs: engine.timeoutMs, recency });
     })
   );
+  clearTimeout(boxTimer);
 
-  const ok = [];
-  const failures = [];
-  settled.forEach((s, i) => {
-    const name = engineNames[i];
-    if (s.status === "fulfilled") {
-      if (s.value.results.length > 0) {
-        ok.push({ engine: name, results: s.value.results });
-        if (debug) console.error(`[web-mcp] ${name}: ${s.value.results.length} 条`);
-      } else {
-        failures.push({ engine: name, message: s.value.note || "空结果" });
-        if (debug) console.error(`[web-mcp] ${name}: 空结果`);
-      }
-    } else {
-      failures.push({ engine: name, message: s.reason?.message || String(s.reason) });
-      if (debug) console.error(`[web-mcp] ${name}: ${s.reason?.message}`);
-    }
-  });
-
-  const results = mergeResults(ok).slice(0, maxResults);
-  if (results.length === 0) {
+  const merged = mergeResults(results).slice(0, maxResults);
+  if (merged.length === 0) {
     throw new Error(
       `所有搜索引擎都失败（${engineNames.join(", ")}）。\n` +
         failures.map((f) => `  ${f.engine}: ${f.message}`).join("\n") +
+        (waived.length ? `\n时间盒放弃: ${waived.join(", ")}` : "") +
         "\n提示：可设置 SERPER_API_KEY 使用稳定的 Google 搜索。"
     );
   }
 
   // 站点权重重排（黑名单剔除 + 权威站前置）
   const { rerank } = await import("./rank.mjs");
-  const ranked = rerank(results);
+  const ranked = rerank(merged);
 
-  return { query, intent, engines: engineNames, recency: recency || "any", results: ranked, failures };
+  return {
+    query,
+    intent,
+    engines: engineNames,
+    recency: recency || "any",
+    results: ranked,
+    failures,
+    waived,
+    elapsedMs: Date.now() - t0,
+    timeBoxMs: boxMs,
+  };
 }

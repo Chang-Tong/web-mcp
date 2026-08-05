@@ -89,12 +89,29 @@ export function browserAvailable() {
   return isEnabled() && (!!executable || !!findExecutable());
 }
 
+function abortErr() {
+  return new DOMException("timebox", "AbortError");
+}
+
+/** 让 playwright 操作与外部信号竞速：abort 时立即抛 AbortError（playwright API 不支持取消） */
+function raceAbort(promise, signal) {
+  if (!signal) return promise;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      if (signal.aborted) return reject(abortErr());
+      signal.addEventListener("abort", () => reject(abortErr()), { once: true });
+    }),
+  ]);
+}
+
 /**
  * 用真实浏览器抓取页面 HTML。
  * @returns {Promise<{status: number, html: string}>} 或抛错
  */
-export async function renderPage(url, { timeoutMs = 30_000, waitNetworkIdle = true } = {}) {
-  const b = await getBrowser();
+export async function renderPage(url, { timeoutMs = 30_000, waitNetworkIdle = true, signal } = {}) {
+  // 浏览器启动也参与竞速（首次 launch 需 2-4s，不能被时间盒拖着）
+  const b = await raceAbort(getBrowser(), signal);
   lastUsed = Date.now();
   const context = await b.newContext({
     userAgent: UA,
@@ -103,14 +120,15 @@ export async function renderPage(url, { timeoutMs = 30_000, waitNetworkIdle = tr
   });
   try {
     const page = await context.newPage();
-    const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-    if (waitNetworkIdle) {
-      await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+    if (signal?.aborted) throw abortErr();
+    const resp = await raceAbort(page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs }), signal);
+    if (waitNetworkIdle && !signal?.aborted) {
+      await raceAbort(page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {}), signal).catch(() => {});
     }
-    const html = await page.content();
+    const html = await raceAbort(page.content(), signal);
     return { status: resp?.status() || 200, html, finalUrl: page.url() };
   } finally {
-    await context.close();
+    await context.close().catch(() => {});
   }
 }
 

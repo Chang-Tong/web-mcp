@@ -310,15 +310,19 @@ function parseBaiduHtml(html) {
 }
 
 async function baiduSearch(query, { maxResults = 5, timeoutMs = 10_000, signal } = {}) {
-  const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`;
-  // 百度间歇性返回验证页/跳转页（无结果容器即视为被挡），等待后重试一次（受时间盒约束）
+  // 重试时切换 URL 形态（tn=baiduhome_pg 是不同入口，可绕过部分风控）
+  const variants = [
+    `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`,
+    `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&tn=baiduhome_pg`,
+  ];
+  // 百度间歇性返回验证页/跳转页（无结果容器即视为被挡），等待后换变体重试（受时间盒约束）
   for (let attempt = 1; ; attempt++) {
-    const html = await httpFetch(url, { timeoutMs, signal });
+    const html = await httpFetch(variants[Math.min(attempt - 1, variants.length - 1)], { timeoutMs, signal });
     assertNotBotPage(html, "baidu");
     const results = parseBaiduHtml(html).slice(0, maxResults);
-    if (results.length > 0 || attempt >= 2) {
+    if (results.length > 0 || attempt >= variants.length) {
       if (results.length > 0) return { engine: "baidu", results };
-      break; // 两次都被挡，进入浏览器兜底
+      break; // 所有变体都被挡，进入浏览器兜底
     }
     await sleepWithSignal(2000, signal);
   }

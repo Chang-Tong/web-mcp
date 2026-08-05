@@ -239,14 +239,27 @@ function parseBingHtml(html) {
   return results;
 }
 
-// bing 匿名 HTTP 对中文查询常返回与查询无关的垃圾结果（分词问题）。
-// 启发式检测：查询中的长 CJK 片段（≥3 字）在结果里命中率 <50% 判为无关 → 浏览器兜底
+// bing 匿名 HTTP 常返回与查询无关的垃圾结果（中文分词 / 英文词条化，如查 "best mcp server" 返回词典）。
+// 启发式检测：查询核心词（中文长片段 ≥3 字；英文词 ≥3 字母去停用词）在结果中命中率 <50% 判为无关 → 浏览器兜底
+const EN_STOP = new Set(["the", "a", "an", "for", "and", "or", "of", "is", "are", "was", "were", "in", "on", "at", "to", "with", "from", "what", "how", "why", "its", "it", "this", "that", "you", "your", "not", "be", "by"]);
+
 function looksIrrelevant(query, results) {
-  const cjk = query.match(/[\u4e00-\u9fff]{3,}/g);
-  if (!cjk || cjk.length === 0) return false;
   const hay = results.map((r) => (r.title + " " + r.snippet).toLowerCase()).join(" ");
-  const hit = cjk.filter((c) => hay.includes(c)).length;
-  return hit / cjk.length < 0.5;
+  // 中英文分开判定：中文片段按 CJK 命中率；英文查询按英文核心词命中率。
+  // 混在一起会被英文专有名词（如 OpenAI）在词条页的命中拉高整体命中率，漏掉垃圾结果。
+  const cjk = query.match(/[\u4e00-\u9fff]{3,}/g) || [];
+  if (cjk.length > 0) {
+    const hit = cjk.filter((c) => hay.includes(c)).length;
+    if (hit / cjk.length < 0.5) return true;
+  }
+  const enWords = (query.toLowerCase().match(/[a-z]{3,}/g) || []).filter(
+    (w) => !EN_STOP.has(w) && !["http", "https", "com", "org", "www"].includes(w)
+  );
+  if (enWords.length > 0) {
+    const hit = enWords.filter((w) => hay.includes(w)).length;
+    if (hit / enWords.length < 0.5) return true;
+  }
+  return false;
 }
 
 async function bingSearch(query, { maxResults = 5, timeoutMs = 10_000, recency, signal } = {}) {
@@ -563,15 +576,17 @@ function normalizeUrl(url) {
   }
 }
 
-function mergeResults(engineResults) {
+function mergeResults(engineResults, capPerEngine = 3) {
   const seen = new Set();
   const merged = [];
   for (const { engine, results } of engineResults) {
+    let added = 0;
     for (const r of results) {
       const key = normalizeUrl(r.url);
       if (seen.has(key)) continue;
       seen.add(key);
       merged.push({ ...r, engine });
+      if (++added >= capPerEngine) break; // 单引擎最多贡献 cap 条，保持来源多样性
     }
   }
   return merged;
@@ -649,7 +664,15 @@ export async function webSearch(query, { maxResults = 5, engines, recency, timeB
   const waived = []; // 因时间盒到期/达标提前收而放弃的引擎
 
   // 时间盒：到期 abort 所有未完成的引擎请求，不等最慢的
-  const boxTimer = setTimeout(() => abortCtrl.abort(), boxMs);
+  const boxTimer = setTimeout(() => {
+    const have = results.reduce((n, x) => n + x.results.length, 0);
+    if (have >= maxResults) {
+      abortCtrl.abort(); // 已达标，直接收
+      return;
+    }
+    // 结果不足 → 给在途引擎 1.5s 缓冲（baidu 重试等常在此时出结果）
+    setTimeout(() => abortCtrl.abort(), 1500);
+  }, boxMs);
   // 浏览器兜底读取剩余预算
   abortCtrl.signal.__remainingMs = () => Math.max(0, deadline - Date.now());
 

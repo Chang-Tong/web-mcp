@@ -19,7 +19,15 @@ const query = process.argv[2] || "Model Context Protocol 是什么";
 
 console.log(`\n== web_search: ${query} ==`);
 const r1 = await client.callTool({ name: "web_search", arguments: { query, max_results: 5 } });
-const searchOut = JSON.parse(r1.content[0].text);
+let searchOut;
+try {
+  searchOut = JSON.parse(r1.content[0].text);
+} catch {
+  // MCP 错误响应（如全部引擎失败）
+  console.log(`工具返回错误: ${r1.content?.[0]?.text?.slice(0, 300) || JSON.stringify(r1)}`);
+  await client.close();
+  process.exit(1);
+}
 console.log(
   `引擎: ${searchOut.engines.join(",")}，结果数: ${searchOut.results.length}` +
     (searchOut.failures.length ? `（失败: ${searchOut.failures.map((f) => `${f.engine}:${f.message.slice(0, 20)}`).join(" / ")}）` : "")

@@ -111,7 +111,8 @@ async function httpGetText(url, { timeoutMs = 15_000, headers = {} } = {}) {
     });
     saveCookies(url, res);
     if (!res.ok) return null;
-    return await res.text();
+    const buf = Buffer.from(await res.arrayBuffer());
+    return decodeHtml(buf, res.headers.get("content-type") || "");
   } finally {
     clearTimeout(timer);
   }
@@ -136,6 +137,32 @@ async function fetchGithubReadme(url) {
     }
   }
   return null;
+}
+
+// ---------- 编码检测与解码（GBK/GB2312/Big5 等中文老站） ----------
+
+function detectCharset(contentType, buf) {
+  // 1. Content-Type 头的 charset 参数（最高优先级）
+  const m1 = contentType.match(/charset=["']?([\w-]+)/i);
+  if (m1) return m1[1];
+  // 2. HTML 文档头部的 meta charset（前 4096 字节，用 latin1 读避免二次乱码）
+  const head = buf.subarray(0, 4096).toString("latin1");
+  const m2 = head.match(/<meta[^>]+charset=["']?([\w-]+)/i);
+  if (m2) return m2[1];
+  return "utf-8";
+}
+
+async function decodeHtml(buf, contentType) {
+  let charset = detectCharset(contentType, buf).toLowerCase();
+  // 统一 WHATWG 编码 label：gb2312 → gb18030（超集），其他常见别名
+  const aliases = { "gb2312": "gb18030", "gb_2312": "gb18030", "gbk": "gb18030", "x-gbk": "gb18030", "cp936": "gb18030", "gb18030": "gb18030" };
+  charset = aliases[charset] || charset;
+  try {
+    return new TextDecoder(charset).decode(buf);
+  } catch {
+    // 未知编码 label → 回退 UTF-8
+    return new TextDecoder("utf-8").decode(buf);
+  }
 }
 
 // ---------- 主入口 ----------
@@ -272,7 +299,8 @@ export async function fetchPage(url, {
       };
     }
 
-    const html = await res.text();
+    const buf = Buffer.from(await res.arrayBuffer());
+    const html = await decodeHtml(buf, contentType);
     return extractHtml(html, finalUrl, mode, maxChars);
   } finally {
     clearTimeout(timer);

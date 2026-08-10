@@ -26,4 +26,6 @@ async function main() {
   }
 }
 
-main().catch((e) => console.log(JSON.stringify({ error: String(e) })));
+main()
+  .then(() => process.exit(0))
+  .catch((e) => { console.log(JSON.stringify({ error: String(e) })); process.exit(1); });

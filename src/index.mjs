@@ -6,8 +6,9 @@
 //   node src/index.mjs --http 8787 --host 0.0.0.0
 //
 // 环境变量：
-//   SEARCH_ENGINE        duckduckgo（默认，免 key）| serper（需 key）
+//   SEARCH_ENGINE        auto（默认，按意图+语言多引擎）| serper（需 key）| tavily（需 key）| searxng（需自托管）| 单引擎名
 //   SERPER_API_KEY       Serper 的 Google 搜索 key
+//   TAVILY_API_KEY       Tavily 搜索 key（注意：免费档有月度配额，超限返回 HTTP 432）
 //   SERPER_GL / SERPER_HL  搜索地区/语言，默认 cn / zh-cn
 //   WEB_MCP_AUTH_TOKEN   可选；HTTP 模式下设置后要求 Authorization: Bearer <token>
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -17,6 +18,7 @@ import { z } from "zod";
 import { webSearch } from "./search.mjs";
 import { fetchPage } from "./fetch.mjs";
 import { searchSummarize, deepSearch } from "./summarize.mjs";
+import { logEntry, logRecent, logStats } from "./log.mjs";
 
 const str = (v) => JSON.stringify(v, null, 2);
 const textContent = (v) => [{ type: "text", text: str(v) }];
@@ -33,12 +35,12 @@ function createMcpServer() {
     {
       title: "联网搜索",
       description:
-        "多引擎并行搜索并返回结构化结果（title/url/snippet/domain/engine 来源）。支持 baidu/brave/bing/duckduckgo（免 key）与 serper（Google，需 SERPER_API_KEY）；auto 模式按查询语言自动选引擎。需要最新信息、事实核查、查新闻、找参考资料时调用；拿到结果后一般再用 fetch_page 打开正文。",
+        "多引擎并行搜索并返回结构化结果（title/url/snippet/domain/engine 来源）。免 key 引擎：baidu/brave/bing/duckduckgo/csdn/wikipedia/stackoverflow；可选 key 引擎：tavily（免费档每月 1000 次，auto 模式在免 key 引擎全灭时自动薅兑底）/serper（需 SERPER_API_KEY）；auto 模式按查询语言自动选引擎，被风控的引擎自动冷却 60s。需要最新信息、事实核查、查新闻、找参考资料时调用；拿到结果后一般再用 fetch_page 打开正文。",
       inputSchema: {
         query: z.string().describe("搜索关键词，可带引号精确匹配"),
         max_results: z.number().min(1).max(20).optional().describe("返回条数，默认 5，多引擎并行时按引擎均分再合并去重"),
         recency: z.enum(["day", "week", "month", "year"]).optional().describe("时间过滤：仅返回该时间范围内的结果（新闻/发布类查询建议用 week）"),
-        engines: z.array(z.enum(["baidu", "brave", "bing", "duckduckgo", "csdn", "searxng", "tavily", "serper"])).optional().describe("指定搜索引擎（默认 auto 自动选择：中文查 baidu+csdn+brave+ddg，英文查 brave+baidu+bing+ddg）"),
+        engines: z.array(z.enum(["baidu", "brave", "bing", "duckduckgo", "csdn", "wikipedia", "stackoverflow", "github", "arxiv", "searxng", "tavily", "serper"])).optional().describe("指定搜索引擎（默认 auto 自动选择：免 key 优先，风控引擎自动冷却；所有免 key 引擎失败时自动用 Tavily 免费额度兑底）"),
       },
     },
     async (args) => {
@@ -51,13 +53,34 @@ function createMcpServer() {
     }
   );
 
+  // ---- 工具 4：查看使用日志（默认 vs 兜底） ----
+  server.registerTool(
+    "web_log",
+    {
+      title: "查看 web-mcp 使用日志",
+      description:
+        "查看搜索/抓取走的路径统计与最近日志，用于调参。action=stats（默认）返回汇总：各引擎成功率/失败/时间盒放弃/冷却次数、Tavily 兑底次数、抓取 direct/jina/browser/error 分布、日均请求量；action=recent 返回最近日志条目。",
+      inputSchema: {
+        action: z.enum(["stats", "recent"]).optional().describe("stats=汇总统计（默认），recent=最近日志"),
+        days: z.number().min(1).max(90).optional().describe("统计最近多少天，默认 7"),
+        limit: z.number().min(1).max(200).optional().describe("recent 模式返回条数，默认 20"),
+      },
+    },
+    async (args) => {
+      if (args.action === "recent") {
+        return { content: textContent(await logRecent(30, args.limit || 20)) };
+      }
+      return { content: textContent(await logStats(args.days || 7)) };
+    }
+  );
+
   // ---- 工具 2：抓取网页 ----
   server.registerTool(
     "fetch_page",
     {
       title: "抓取网页内容",
       description:
-        "抓取一个 URL 的内容。支持三种模式：text（粗提取为 markdown，默认）、readable（Readability 提取正文，去导航/广告）、json（API 接口直接解析）。GitHub 仓库页自动抓取 README。用于引用、事实核查、阅读全文。",
+        "抓取一个 URL 的内容。支持三种模式：text（粗提取为 markdown，默认）、readable（Readability 提取正文，去导航/广告）、json（API 接口直接解析）。GitHub 仓库页自动抓取 README。目标站反爬/网络错误时自动用 r.jina.ai 免费代理兑底，再不行用浏览器渲染。用于引用、事实核查、阅读全文。",
       inputSchema: {
         url: z.string().describe("要抓取的 URL"),
         max_chars: z.number().min(1000).optional().describe("最多保留字符数，默认 20000"),

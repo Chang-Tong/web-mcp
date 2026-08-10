@@ -165,6 +165,42 @@ async function decodeHtml(buf, contentType) {
   }
 }
 
+// ---------- r.jina.ai 免费抓取兜底（免 key，能薅则薅；目标站反爬/网络错误时使用） ----------
+
+async function fetchViaJina(url, maxChars, timeoutMs, headers) {
+  // 带自定义 Cookie/认证头的请求不走 Jina（Jina 无同样上下文）
+  if (headers && Object.keys(headers).length > 0) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 20_000));
+    try {
+      const res = await fetch(`https://r.jina.ai/${url}`, {
+        headers: { "User-Agent": UA, "X-No-Cache": "true" },
+        signal: controller.signal,
+        redirect: "follow",
+        ...(proxyAgent ? { dispatcher: proxyAgent } : {}),
+      });
+      if (!res.ok) return null;
+      const text = (await res.text()).trim();
+      if (!text || text.length < 100) return null;
+      return {
+        type: "text",
+        url,
+        title: "",
+        note: "经 r.jina.ai 免费代理抓取（原站反爬，走免 key 兜底）",
+        text: text.slice(0, maxChars) + (text.length > maxChars ? "\n…（已截断）" : ""),
+        chars: text.length,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
+import { logEntry } from "./log.mjs";
+
 // ---------- 主入口 ----------
 
 async function extractHtml(html, finalUrl, mode, maxChars) {
@@ -207,7 +243,7 @@ async function extractHtml(html, finalUrl, mode, maxChars) {
   return { type: "text", url: finalUrl, title, description, text, chars: text.length, truncated };
 }
 
-export async function fetchPage(url, {
+async function fetchPageInner(url, {
   maxChars = 20_000,
   timeoutMs = 30_000,
   mode = "auto", // auto | text | readable | json
@@ -224,10 +260,11 @@ export async function fetchPage(url, {
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
   try {
     const host = new URL(url).hostname;
     const jar = cookieJar.get(host);
-    const res = await fetch(url, {
+    res = await fetch(url, {
       headers: {
         "User-Agent": UA,
         Accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
@@ -238,14 +275,26 @@ export async function fetchPage(url, {
       redirect: "follow",
       ...(proxyAgent ? { dispatcher: proxyAgent } : {}),
     });
-    saveCookies(url, res);
-    if (!res.ok) {
-      // 403/5xx：目标站反爬/封锁 → 浏览器渲染兜底（不处理 json 模式与显式认证头）
-      if (mode !== "json") {
-        try {
+  } catch (err) {
+    // 网络错误（连接拒绝/超时/证书等）→ r.jina.ai 免费兜底
+    if (mode !== "json") {
+      const viaJina = await fetchViaJina(url, maxChars, timeoutMs, headers);
+      if (viaJina) return viaJina;
+    }
+    throw err;
+  }
+  try {
+  saveCookies(url, res);
+  if (!res.ok) {
+    // 403/5xx：目标站反爬/封锁 → 先 r.jina.ai 免费兜底，再浏览器渲染兜底（不处理 json 模式与显式认证头）
+    if (mode !== "json") {
+      const viaJina = await fetchViaJina(url, maxChars, timeoutMs, headers);
+      if (viaJina) return viaJina;
+      try {
           const { renderPage } = await import("./browser.mjs");
           const rendered = await renderPage(url, { timeoutMs: Math.min(timeoutMs, 30_000) });
-          return extractHtml(rendered.html, rendered.finalUrl || url, mode, maxChars);
+          const out = extractHtml(rendered.html, rendered.finalUrl || url, mode, maxChars);
+          return { ...out, note: "经浏览器渲染兜底（原站反爬）" };
         } catch {}
       }
       throw new Error(`HTTP ${res.status} ${res.statusText}`);
@@ -304,5 +353,40 @@ export async function fetchPage(url, {
     return extractHtml(html, finalUrl, mode, maxChars);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * 对外入口：包一层内层实现，记录每次抓取走的路径（direct / jina / browser / error）
+ */
+export async function fetchPage(url, opts = {}) {
+  const t0 = Date.now();
+  const mode = opts.mode || "auto";
+  try {
+    const out = await fetchPageInner(url, opts);
+    const note = out.note || "";
+    const path = note.includes("r.jina.ai") ? "jina" : note.includes("浏览器渲染") ? "browser" : "direct";
+    logEntry({
+      type: "fetch",
+      url,
+      mode,
+      path,
+      ok: true,
+      chars: out.chars || 0,
+      elapsedMs: Date.now() - t0,
+      note: note || undefined,
+    });
+    return out;
+  } catch (err) {
+    logEntry({
+      type: "fetch",
+      url,
+      mode,
+      path: "error",
+      ok: false,
+      error: (err?.message || String(err)).slice(0, 200),
+      elapsedMs: Date.now() - t0,
+    });
+    throw err;
   }
 }

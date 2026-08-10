@@ -10,6 +10,8 @@
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
+import { logEntry } from "./log.mjs";
+
 // ---------- 通用 ----------
 
 // 走系统代理（http_proxy/https_proxy/no_proxy 环境变量）；无代理环境自动直连
@@ -190,6 +192,14 @@ async function braveThrottle(signal) {
   lastBraveTs = Date.now();
 }
 
+// baidu 对高频请求同样敏感，全局节流：相邻请求至少间隔 1.5s（配合变体重试，大幅降低验证页命中）
+let lastBaiduTs = 0;
+async function baiduThrottle(signal) {
+  const gap = 1500 - (Date.now() - lastBaiduTs);
+  if (gap > 0) await sleepWithSignal(gap, signal);
+  lastBaiduTs = Date.now();
+}
+
 async function braveSearch(query, { maxResults = 5, timeoutMs = 15_000, recency, signal } = {}) {
   await braveThrottle(signal);
   if (signal?.aborted) throw new DOMException("timebox", "AbortError");
@@ -247,7 +257,12 @@ function looksIrrelevant(query, results) {
   const hay = results.map((r) => (r.title + " " + r.snippet).toLowerCase()).join(" ");
   // 中英文分开判定：中文片段按 CJK 命中率；英文查询按英文核心词命中率。
   // 混在一起会被英文专有名词（如 OpenAI）在词条页的命中拉高整体命中率，漏掉垃圾结果。
-  const cjk = query.match(/[\u4e00-\u9fff]{3,}/g) || [];
+  // CJK 词：按空白/标点分词后取每个 token 的中文片段（≥2 字即可，覆盖"北京/饮水/供水"这类 2 字词）
+  const cjk = query
+    .split(/[\s,，。、;；:：'"!?！？]+/)
+    .map((t) => t.match(/[\u4e00-\u9fff]{2,}/g))
+    .flat()
+    .filter(Boolean) || [];
   if (cjk.length > 0) {
     const hit = cjk.filter((c) => hay.includes(c)).length;
     if (hit / cjk.length < 0.5) return true;
@@ -310,6 +325,8 @@ function parseBaiduHtml(html) {
 }
 
 async function baiduSearch(query, { maxResults = 5, timeoutMs = 10_000, signal } = {}) {
+  await baiduThrottle(signal);
+  if (signal?.aborted) throw new DOMException("timebox", "AbortError");
   // 重试时切换 URL 形态（tn=baiduhome_pg 是不同入口，可绕过部分风控）
   const variants = [
     `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`,
@@ -501,15 +518,24 @@ async function searxngSearch(query, { maxResults = 5, timeoutMs = 10_000 } = {})
   return { engine: "searxng", results };
 }
 
-// ---------- Tavily（可选：TAVILY_API_KEY，tavily-mcp 思路） ----------
+// ---------- Tavily（可选：TAVILY_API_KEY，tavily-mcp 思路；免费档每月 1000 次，能薅则薅） ----------
 
 async function tavilySearch(query, { maxResults = 5, apiKey, timeoutMs = 12_000 } = {}) {
-  const json = await httpFetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ api_key: apiKey, query, search_depth: "basic", max_results: maxResults, include_answer: false }),
-    timeoutMs,
-  });
+  let json;
+  try {
+    json = await httpFetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: apiKey, query, search_depth: "basic", max_results: maxResults, include_answer: false }),
+      timeoutMs,
+    });
+  } catch (err) {
+    if (/HTTP 432/.test(err.message)) {
+      // 432 = 免费档月度配额耗尽（每月重置），抛出明确标记，由冷却机制处理到下月 1 日
+      throw new Error("tavily: 本月免费配额已耗尽（每月重置后自动恢复）");
+    }
+    throw err;
+  }
   let data;
   try {
     data = JSON.parse(json);
@@ -555,7 +581,102 @@ async function serperSearch(query, { maxResults = 5, apiKey, timeoutMs = 10_000,
   return { engine: "serper", results };
 }
 
+// ---------- Wikipedia（免 key，百科/知识类稳定源，无风控压力） ----------
+
+async function wikipediaSearch(query, { maxResults = 5, timeoutMs = 10_000 } = {}) {
+  const langs = /[\u4e00-\u9fff]/.test(query) ? ["zh", "en"] : ["en"];
+  const results = [];
+  for (const lang of langs) {
+    const json = await httpFetch(
+      `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=${Math.min(maxResults, 10)}`,
+      { timeoutMs, headers: { Accept: "application/json", "Api-User-Agent": "web-mcp/0.1 (https://github.com/local/web-mcp)" } }
+    );
+    let data;
+    try {
+      data = JSON.parse(json);
+    } catch {
+      continue;
+    }
+    for (const it of data?.query?.search || []) {
+      results.push({
+        title: it.title || "",
+        url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent((it.title || "").replace(/ /g, "_"))}`,
+        snippet: (it.snippet || "").replace(/<[^>]+>/g, ""),
+        date: "",
+        domain: `${lang}.wikipedia.org`,
+      });
+    }
+    if (results.length >= maxResults) break;
+  }
+  if (!results.length) throw new Error("wikipedia: 空结果");
+  return { engine: "wikipedia", results: results.slice(0, maxResults) };
+}
+
+// ---------- StackOverflow（免 key，每天 300 次免费额度，技术类兜底） ----------
+
+async function stackoverflowSearch(query, { maxResults = 5, timeoutMs = 10_000 } = {}) {
+  const json = await httpFetch(
+    `https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=${encodeURIComponent(query)}&site=stackoverflow&pagesize=${Math.min(maxResults, 10)}`,
+    { timeoutMs, headers: { Accept: "application/json" } }
+  );
+  let data;
+  try {
+    data = JSON.parse(json);
+  } catch {
+    throw new Error("StackOverflow 返回非 JSON");
+  }
+  if (data.error_message) throw new Error(`StackOverflow: ${data.error_message}`);
+  const items = (data.items || []).slice(0, maxResults).map((it) => ({
+    title: it.title || "",
+    url: it.link || "",
+    snippet: [(it.tags || []).join(", "), it.is_answered ? "已解答" : ""].filter(Boolean).join(" | "),
+    date: it.creation_date ? new Date(it.creation_date * 1000).toISOString().slice(0, 10) : "",
+    domain: "stackoverflow.com",
+  }));
+  if (!items.length) throw new Error("stackoverflow: 空结果");
+  return { engine: "stackoverflow", results: items };
+}
+
 // ---------- 引擎注册表与编排 ----------
+
+// ---------- 风控冷却（会话级） ----------
+// 引擎被限流后进入冷却期，冷却期内不再调度该引擎（避免同一出口 IP 反复触发风控）；
+// 若所有引擎都在冷却则仍全部执行，避免查询空转。
+const RATE_LIMIT_HINTS = [
+  /HTTP (429|403)/,
+  /反爬/,
+  /验证码/,
+  /安全验证/,
+  /限流/,
+  /rate limit/i,
+  /too many requests/i,
+  /空结果（可能被限流）/, // ddg 空结果基本等于被限流
+];
+const COOLDOWN_MS = 60_000;
+const engineCooldown = new Map(); // engine -> 冷却截止时间戳
+const engineAbortCount = new Map(); // engine -> 连续时间盒放弃次数（达到 2 次视为过慢/持续限流，进入冷却）
+
+function isRateLimited(message) {
+  return RATE_LIMIT_HINTS.some((re) => re.test(message || ""));
+}
+
+function markEngineCooldown(name, message) {
+  if (isRateLimited(message)) engineCooldown.set(name, Date.now() + COOLDOWN_MS);
+  else if (name === "tavily" && /配额|usage limit|432/i.test(message || "")) {
+    // Tavily 免费档每月重置：直接冷却到下月 1 日，本月内不再白试
+    const next = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1);
+    engineCooldown.set(name, next.getTime());
+  }
+}
+
+function coolingEngines(now = Date.now()) {
+  const out = [];
+  for (const [name, until] of engineCooldown) {
+    if (until > now) out.push(name);
+    else engineCooldown.delete(name);
+  }
+  return out;
+}
 
 const ENGINES = {
   baidu: { exec: baiduSearch, timeoutMs: 12_000 },
@@ -565,6 +686,8 @@ const ENGINES = {
   duckduckgo: { exec: duckduckgoSearch, timeoutMs: 10_000 },
   github: { exec: githubSearch, timeoutMs: 12_000 },
   arxiv: { exec: arxivSearch, timeoutMs: 12_000 },
+  wikipedia: { exec: wikipediaSearch, timeoutMs: 10_000 },
+  stackoverflow: { exec: stackoverflowSearch, timeoutMs: 10_000 },
   searxng: { exec: searxngSearch, timeoutMs: 10_000 },
   tavily: { exec: tavilySearch, timeoutMs: 12_000 },
 };
@@ -626,10 +749,10 @@ function detectIntent(query) {
 }
 
 const INTENT_ENGINES = {
-  code: { cjk: ["csdn", "github", "brave", "baidu"], en: ["github", "brave", "bing", "duckduckgo"] },
-  academic: { cjk: ["baidu", "arxiv", "brave", "csdn"], en: ["arxiv", "brave", "bing", "duckduckgo"] },
+  code: { cjk: ["csdn", "github", "stackoverflow", "brave", "baidu"], en: ["github", "stackoverflow", "brave", "bing", "duckduckgo"] },
+  academic: { cjk: ["baidu", "arxiv", "wikipedia", "brave", "csdn"], en: ["arxiv", "wikipedia", "brave", "bing", "duckduckgo"] },
   news: { cjk: ["baidu", "brave", "bing"], en: ["brave", "bing", "duckduckgo"] },
-  general: { cjk: ["baidu", "csdn", "brave", "duckduckgo"], en: ["brave", "baidu", "bing", "duckduckgo"] },
+  general: { cjk: ["baidu", "csdn", "wikipedia", "brave", "duckduckgo"], en: ["wikipedia", "brave", "baidu", "bing", "duckduckgo"] },
 };
 
 /**
@@ -638,12 +761,12 @@ const INTENT_ENGINES = {
  *   - 否则读 SEARCH_ENGINE env：serper=Google；单引擎名=只用它；auto=按意图+语言自动选
  */
 function resolveEngines(query, requested) {
-  if (requested && requested.length > 0) return { engines: requested.map((e) => e.toLowerCase()), intent: "manual" };
+  if (requested && requested.length > 0) return { engines: requested.map((e) => e.toLowerCase()), intent: "manual", auto: false };
   const env = (process.env.SEARCH_ENGINE || "auto").toLowerCase();
-  if (env === "serper") return { engines: ["serper"], intent: "manual" };
-  if (env === "tavily") return { engines: ["tavily"], intent: "manual" };
-  if (env === "searxng") return { engines: ["searxng"], intent: "manual" };
-  if (env !== "auto") return { engines: [env], intent: "manual" };
+  if (env === "serper") return { engines: ["serper"], intent: "manual", auto: false };
+  if (env === "tavily") return { engines: ["tavily"], intent: "manual", auto: false };
+  if (env === "searxng") return { engines: ["searxng"], intent: "manual", auto: false };
+  if (env !== "auto") return { engines: [env], intent: "manual", auto: false };
   const intent = detectIntent(query);
   const hasCJK = /[\u4e00-\u9fff]/.test(query);
   let engines = INTENT_ENGINES[intent][hasCJK ? "cjk" : "en"];
@@ -651,15 +774,24 @@ function resolveEngines(query, requested) {
   if (hasCJK && !engines.includes("bing") && browserAvailableFlag) {
     engines = [...engines.slice(0, 2), "bing", ...engines.slice(2)];
   }
-  return { engines, intent };
+  return { engines, intent, auto: true };
 }
 
 export async function webSearch(query, { maxResults = 5, engines, recency, timeBoxMs } = {}) {
   if (!query || !query.trim()) throw new Error("query 不能为空");
   const t0 = Date.now();
-  const { engines: engineNames, intent } = await resolveEngines(query, engines);
+  const { engines: engineNames, intent, auto } = await resolveEngines(query, engines);
+  // 跳过冷却中的引擎（若全部在冷却则仍全部执行，避免查询空转）
+  const cooling = coolingEngines();
+  const names = (() => {
+    const active = engineNames.filter((n) => !cooling.includes(n));
+    return active.length > 0 ? active : engineNames;
+  })();
   const debug = !!process.env.WEB_MCP_DEBUG;
-  const boxMs = timeBoxMs || Number(process.env.WEB_MCP_TIME_BOX) || 5000;
+  if (debug && cooling.length) console.error(`[web-mcp] 冷却跳过引擎: ${cooling.join(", ")}`);
+  // 时间盒默认 12s：给 baidu 变体重试（2s）、brave 节流+退避（1.5s+2s+5s）留足完成时间，
+  // 很多"限流"其实是时间盒太紧导致的假失败，调大后重试成功率显著提升
+  const boxMs = timeBoxMs || Number(process.env.WEB_MCP_TIME_BOX) || 12000;
   const deadline = Date.now() + boxMs;
   const abortCtrl = new AbortController();
 
@@ -681,7 +813,7 @@ export async function webSearch(query, { maxResults = 5, engines, recency, timeB
   abortCtrl.signal.__remainingMs = () => Math.max(0, deadline - Date.now());
 
   await Promise.all(
-    engineNames.map(async (name) => {
+    names.map(async (name) => {
       try {
         let out;
         if (name === "serper") {
@@ -699,17 +831,30 @@ export async function webSearch(query, { maxResults = 5, engines, recency, timeB
           out = await engine.exec(query, { maxResults, timeoutMs: engine.timeoutMs, recency, signal: abortCtrl.signal });
         }
         if (out.results.length > 0) {
+          engineAbortCount.delete(name); // 成功一次，重置连续放弃计数
           results.push({ engine: name, results: out.results });
           if (debug) console.error(`[web-mcp] ${name}: ${out.results.length} 条`);
         } else {
+          // ddg/bing 空结果基本等于被限流，计入冷却；其他引擎空结果可能只是无匹配内容
+          markEngineCooldown(name, name === "duckduckgo" || name === "bing" ? "空结果（可能被限流）" : out.note || "空结果");
           failures.push({ engine: name, message: out.note || "空结果" });
           if (debug) console.error(`[web-mcp] ${name}: 空结果`);
         }
       } catch (err) {
         if (err?.name === "AbortError") {
+          const n = (engineAbortCount.get(name) || 0) + 1;
+          if (n >= 2) {
+            // 连续两次时间盒放弃：引擎过慢或持续限流，冷却 60s
+            engineCooldown.set(name, Date.now() + COOLDOWN_MS);
+            engineAbortCount.delete(name);
+            if (debug) console.error(`[web-mcp] ${name}: 连续放弃，进入冷却`);
+          } else {
+            engineAbortCount.set(name, n);
+          }
           waived.push(name);
           if (debug) console.error(`[web-mcp] ${name}: 时间盒放弃`);
         } else {
+          markEngineCooldown(name, err?.message || String(err));
           failures.push({ engine: name, message: err?.message || String(err) });
           if (debug) console.error(`[web-mcp] ${name}: ${err?.message}`);
         }
@@ -723,13 +868,42 @@ export async function webSearch(query, { maxResults = 5, engines, recency, timeB
   );
   clearTimeout(boxTimer);
 
-  const merged = mergeResults(results).slice(0, maxResults);
+  const merged0 = mergeResults(results).slice(0, maxResults);
+  let merged = merged0;
+  // 免 key 引擎全部失败（或全在冷却），且为 auto 编排 → 用 Tavily 免费额度兜底一次（每月 1000 次，能薅则薅）
+  if (merged0.length === 0 && auto && !coolingEngines().includes("tavily") && process.env.TAVILY_API_KEY) {
+    try {
+      const out = await tavilySearch(query, { maxResults, apiKey: process.env.TAVILY_API_KEY, timeoutMs: 12_000 });
+      if (out.results.length > 0) {
+        results.push({ engine: "tavily(fallback)", results: out.results });
+        if (debug) console.error(`[web-mcp] 免 key 引擎全灭，Tavily 免费额度兜底成功: ${out.results.length} 条`);
+      }
+    } catch (err) {
+      markEngineCooldown("tavily", err?.message || String(err));
+      failures.push({ engine: "tavily", message: err?.message || String(err) });
+    }
+    merged = mergeResults(results).slice(0, maxResults);
+  }
   if (merged.length === 0) {
+    // 失败也记日志，便于发现系统性风控
+    logEntry({
+      type: "search",
+      ok: false,
+      query,
+      intent,
+      auto,
+      engines: engineNames,
+      failures,
+      waived,
+      cooling: coolingEngines(),
+      elapsedMs: Date.now() - t0,
+      timeBoxMs: boxMs,
+    });
     throw new Error(
-      `所有搜索引擎都失败（${engineNames.join(", ")}）。\n` +
+      `所有搜索引擎都失败（${names.join(", ")}）。\n` +
         failures.map((f) => `  ${f.engine}: ${f.message}`).join("\n") +
         (waived.length ? `\n时间盒放弃: ${waived.join(", ")}` : "") +
-        "\n提示：可设置 SERPER_API_KEY 使用稳定的 Google 搜索。"
+        "\n提示：可设置 SERPER_API_KEY 使用稳定的 Google 搜索，或用 SEARCH_ENGINE 固定引擎。"
     );
   }
 
@@ -737,14 +911,34 @@ export async function webSearch(query, { maxResults = 5, engines, recency, timeB
   const { rerank } = await import("./rank.mjs");
   const ranked = rerank(merged);
 
+  // 使用日志：默认 vs 兜底路径（供 web_log 工具统计调参）
+  logEntry({
+    type: "search",
+    ok: true,
+    query,
+    intent,
+    auto,
+    engines: engineNames,
+    results: ranked.length,
+    byEngine: results.map(({ engine, results: rs }) => ({ engine, n: rs.length })),
+    failures,
+    waived,
+    cooling: coolingEngines(),
+    tavilyFallback: results.some((r) => r.engine === "tavily(fallback)"),
+    elapsedMs: Date.now() - t0,
+    timeBoxMs: boxMs,
+  });
+
   return {
     query,
     intent,
     engines: engineNames,
+    auto,
     recency: recency || "any",
     results: ranked,
     failures,
     waived,
+    cooling: coolingEngines(),
     elapsedMs: Date.now() - t0,
     timeBoxMs: boxMs,
   };

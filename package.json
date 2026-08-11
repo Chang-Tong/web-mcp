@@ -1,7 +1,7 @@
 {
   "name": "web-mcp",
   "version": "0.1.0",
-  "description": "联网 MCP 服务：web_search（DuckDuckGo/Serper）+ fetch_page，支持 stdio 与 Streamable HTTP 部署",
+  "description": "给本地小模型插上联网的翅膀：免 key 多引擎并行搜索 + 网页抓取 MCP 服务，支持 stdio 与 Streamable HTTP 部署",
   "type": "module",
   "bin": {
     "web-mcp": "src/index.mjs"
